@@ -3,7 +3,6 @@
 import asyncio
 import logging
 from time import perf_counter
-import aiohttp
 from async_crawler.crawler import AsyncCrawler
 
 URLS = [
@@ -55,57 +54,49 @@ async def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    # 1. Последовательная загрузка
-    crawler = AsyncCrawler(max_concurrent=20)
-    sequential_results = {}
+    crawler = AsyncCrawler(max_concurrent=25)
+
+    start = perf_counter()
 
     try:
-        start = perf_counter()
-
-        for url in URLS:
-            try:
-                html = await crawler.fetch_url(url)
-                sequential_results[url] = html
-
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                continue
-
-        sequential_time = perf_counter() - start
-
+        results = await asyncio.gather(
+            *(crawler.fetch_and_parse(url) for url in URLS),
+            return_exceptions=True,
+        )
     finally:
         await crawler.close()
 
-    # 2. Конкурентная загрузка
-    crawler = AsyncCrawler(max_concurrent=20)
+    elapsed = perf_counter() - start
+    successful = 0
 
-    try:
-        start = perf_counter()
-        concurrent_results = await crawler.fetch_urls(URLS)
-        concurrent_time = perf_counter() - start
+    for url, result in zip(URLS, results):
+        print(f"\n{'=' * 60}")
+        print(f"URL: {url}")
 
-    finally:
-        await crawler.close()
+        if isinstance(result, BaseException):
+            print(f"ERROR: {type(result).__name__}: {result}")
+            continue
 
-    # 3. Вывод результатов
-    print("\n--- РЕЗУЛЬТАТЫ ---")
+        successful += 1
 
-    print(f"Последовательно: {sequential_time:.2f} с")
-    print(f"Конкурентно: {concurrent_time:.2f} с")
+        summary = {
+            "url": result["url"],
+            "title": result["title"],
+            "text_length": len(result["text"]),
+            "links_count": len(result["links"]),
+            "links": result["links"][:5],
+            "images_count": len(result["images"]),
+            "headings": result["headings"],
+            "metadata": result["metadata"],
+        }
 
-    print(
-        f"Ускорение: "
-        f"{sequential_time / concurrent_time:.2f}x"
-    )
+        print(summary)
 
-    print(
-        f"Успешно (последовательно): "
-        f"{len(sequential_results)}/{len(URLS)}"
-    )
-
-    print(
-        f"Успешно (конкурентно): "
-        f"{len(concurrent_results)}/{len(URLS)}"
-    )
+    print("\n--- ИТОГОВАЯ СТАТИСТИКА ---")
+    print(f"Всего страниц: {len(URLS)}")
+    print(f"Успешно обработано: {successful}")
+    print(f"Ошибок: {len(URLS) - successful}")
+    print(f"Время выполнения: {elapsed:.2f} с")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
 """HTTP-клиент. Step 1"""
-
+from async_crawler.parser import HTMLParser
 import asyncio
 import logging
 import aiohttp
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,7 @@ class AsyncCrawler:
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: aiohttp.ClientSession | None = None
         self.timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=10)
+        self.html_parser = HTMLParser()
 
     async def fetch_url(self, url: str) -> str:
         """Загрузить HTML одной страницы."""
@@ -49,6 +51,11 @@ class AsyncCrawler:
             for url, result in zip(urls, results)
             if isinstance(result, str)
         }
+
+    async def fetch_and_parse(self, url: str) -> dict[str, Any]:
+        """Загрузить страницу и извлечь структурированные данные."""
+        html = await self.fetch_url(url)
+        return await self.html_parser.parse_html(html, url)
 
     async def close(self) -> None:
         """Закрыть HTTP-сессию."""

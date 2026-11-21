@@ -1,11 +1,40 @@
 import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import aiohttp
 import pytest
 from aiohttp import web
 from aiointercept import aiointercept
 from async_crawler.crawler import AsyncCrawler
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_parse(monkeypatch):
+    crawler = AsyncCrawler()
+    url = "https://example.com/page"
+    html = "<title>Example</title><a href='/about'>About</a>"
+    fetch = AsyncMock(return_value=html)
+    monkeypatch.setattr(crawler, "fetch_url", fetch)
+
+    result = await crawler.fetch_and_parse(url)
+
+    fetch.assert_awaited_once_with(url)
+    assert result["url"] == url
+    assert result["title"] == "Example"
+    assert result["links"] == ["https://example.com/about"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_parse_propagates_fetch_error(monkeypatch):
+    crawler = AsyncCrawler()
+    monkeypatch.setattr(crawler, "fetch_url", AsyncMock(side_effect=asyncio.TimeoutError))
+    parse = AsyncMock()
+    monkeypatch.setattr(crawler.html_parser, "parse_html", parse)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await crawler.fetch_and_parse("https://example.com/")
+
+    parse.assert_not_awaited()
 
 
 @pytest.mark.asyncio
