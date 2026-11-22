@@ -1,7 +1,9 @@
 """Демонстрация работы краулера: poetry run python main.py."""
 
 import asyncio
+import json
 import logging
+from pathlib import Path
 from time import perf_counter
 from async_crawler.crawler import AsyncCrawler
 
@@ -54,49 +56,53 @@ async def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    crawler = AsyncCrawler(max_concurrent=25)
+    crawler = AsyncCrawler(
+        max_concurrent=100,
+        max_per_domain=50,
+        max_depth=10,
+    )
 
     start = perf_counter()
 
     try:
-        results = await asyncio.gather(
-            *(crawler.fetch_and_parse(url) for url in URLS),
-            return_exceptions=True,
+        results = await crawler.crawl(
+            start_urls=URLS,
+            max_pages=100,
+            same_domain_only=False,
         )
-    finally:
-        await crawler.close()
 
-    elapsed = perf_counter() - start
-    successful = 0
+        elapsed = perf_counter() - start
 
-    for url, result in zip(URLS, results):
-        print(f"\n{'=' * 60}")
-        print(f"URL: {url}")
+        print("\n--- РЕЗУЛЬТАТЫ ОБХОДА ---")
 
-        if isinstance(result, BaseException):
-            print(f"ERROR: {type(result).__name__}: {result}")
-            continue
+        for url, data in results.items():
+            print(f"URL: {url}")
+            print(f"Title: {data['title']}")
+            print(f"Links: {len(data['links'])}")
+            print(f"Text length: {len(data['text'])}")
+            print("-" * 50)
 
-        successful += 1
+        print("\n--- СТАТИСТИКА ---")
+        print(f"Посещено: {len(crawler.visited_urls)}")
+        print(f"Успешно: {len(crawler.processed_urls)}")
+        print(f"Ошибок: {len(crawler.failed_urls)}")
+        print(f"Время: {elapsed:.2f} с")
 
-        summary = {
-            "url": result["url"],
-            "title": result["title"],
-            "text_length": len(result["text"]),
-            "links_count": len(result["links"]),
-            "links": result["links"][:5],
-            "images_count": len(result["images"]),
-            "headings": result["headings"],
-            "metadata": result["metadata"],
+        output = {
+            "results": results,
+            "failed_urls": crawler.failed_urls,
+            "visited_urls": sorted(crawler.visited_urls),
         }
 
-        print(summary)
+        path = Path("crawl_results.json")
 
-    print("\n--- ИТОГОВАЯ СТАТИСТИКА ---")
-    print(f"Всего страниц: {len(URLS)}")
-    print(f"Успешно обработано: {successful}")
-    print(f"Ошибок: {len(URLS) - successful}")
-    print(f"Время выполнения: {elapsed:.2f} с")
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(output, file, ensure_ascii=False, indent=2)
+
+        print(f"\nДанные сохранены в {path}")
+
+    finally:
+        await crawler.close()
 
 
 if __name__ == "__main__":
