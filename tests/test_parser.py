@@ -132,7 +132,7 @@ def test_extract_tables_and_lists():
 
 @pytest.mark.asyncio
 async def test_fetch_and_parse():
-    crawler = AsyncCrawler()
+    crawler = AsyncCrawler(respect_robots=False, requests_per_second=1000)
     async with aiointercept() as mocked:
         url = f"{mocked.server_url}/page"
         mocked.get(url, status=200, body=HTML)
