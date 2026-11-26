@@ -18,11 +18,19 @@ from async_crawler.robots import RobotsParser
 from async_crawler.semaphore import SemaphoreManager
 from async_crawler.http_utils import retry_after_seconds
 from collections import deque
+from async_crawler.retry import RetryStrategy
+from async_crawler.exceptions import (
+    TransientError,
+    PermanentError,
+    NetworkError,
+    ParseError,
+)
 
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 _final_url: ContextVar[str | None] = ContextVar("crawler_final_url", default=None)
+_retry_attempt: ContextVar[int] = ContextVar("crawler_retry_attempt", default=0)
 
 
 class RobotsDisallowedError(Exception):
@@ -43,6 +51,11 @@ class AsyncCrawler:
             max_retries: int = 3,
             base_backoff: float = 1.0,
             max_backoff: float = 30.0,
+            retry_strategy: RetryStrategy | None = None,
+            connect_timeout: float = 10.0,
+            read_timeout: float = 10.0,
+            total_timeout: float = 30.0,
+            timeout_multiplier: float = 2.0,
     ) -> None:
         if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int) or max_concurrent <= 0:
             raise ValueError("max_concurrent must be a positive integer")
@@ -66,7 +79,16 @@ class AsyncCrawler:
         self.max_depth = max_depth
         self.semaphore_manager = SemaphoreManager(max_concurrent, max_per_domain)
         self.session: aiohttp.ClientSession | None = None
-        self.timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=10)
+        for name, value in (("connect_timeout", connect_timeout), ("read_timeout", read_timeout),
+                            ("total_timeout", total_timeout), ("timeout_multiplier", timeout_multiplier)):
+            try:
+                number = float(value) if not isinstance(value, bool) and isinstance(value, (int, float)) else 0
+            except OverflowError:
+                number = 0
+            if not math.isfinite(number) or number <= 0 or (name == "timeout_multiplier" and number < 1):
+                raise ValueError(f"{name} must be a positive finite number" + (" >= 1" if name == "timeout_multiplier" else ""))
+        self.timeout = aiohttp.ClientTimeout(total=float(total_timeout), connect=float(connect_timeout), sock_read=float(read_timeout))
+        self.timeout_multiplier = float(timeout_multiplier)
         self.html_parser = HTMLParser()
         self.visited_urls: set[str] = set()
         self.failed_urls: dict[str, str] = {}
@@ -81,9 +103,26 @@ class AsyncCrawler:
         self.respect_robots = respect_robots
         self.user_agent = user_agent
         self.blocked_urls: set[str] = set()
+        self.permanent_error_urls: set[str] = set()
         self.robots_parser = RobotsParser(request=self._request)
         self._allowed_hosts: set[str] | None = None
         self._reset_request_stats()
+        self.retry_strategy = (
+            retry_strategy
+            if retry_strategy is not None
+            else RetryStrategy(
+                max_retries=max_retries,
+                base_backoff=base_backoff,
+                max_backoff=max_backoff,
+                backoff_factor=2.0,
+                retries_by_error={
+                    NetworkError: 2,
+                },
+                backoff_by_error={
+                    NetworkError: base_backoff * 2,
+                },
+            )
+        )
 
     def _reset_request_stats(self) -> None:
         self._stats_started = perf_counter()
@@ -139,8 +178,73 @@ class AsyncCrawler:
         async with self.semaphore_manager.limit(url):
             await self.rate_limiter.acquire(domain, crawl_delay=crawl_delay)
             self._record_request(domain)
-            async with self.session.get(url, allow_redirects=False) as response:
+            options = {"allow_redirects": False}
+            if _retry_attempt.get():
+                try:
+                    factor = min(self.timeout_multiplier ** _retry_attempt.get(), 4.0)
+                except OverflowError:
+                    factor = 4.0
+                options["timeout"] = aiohttp.ClientTimeout(
+                    total=self.timeout.total * factor, connect=self.timeout.connect * factor,
+                    sock_read=self.timeout.sock_read * factor,
+                )
+            async with self.session.get(url, **options) as response:
                 yield response
+
+    async def _fetch_once(self, url: str) -> tuple[bool, str]:
+        """Выполнить одну попытку загрузки."""
+        try:
+            async with self._request(url) as response:
+                if 300 <= response.status < 400:
+                    return True, redirect_target(response, url)
+
+                response.raise_for_status()
+
+                return False, await response.text()
+
+        except aiohttp.ClientResponseError as error:
+            if error.status in RETRYABLE_STATUSES:
+                retry_after = retry_after_seconds(
+                    error.headers.get("Retry-After")
+                    if error.headers else None
+                )
+
+                raise TransientError(
+                    str(error),
+                    url=url,
+                    status=error.status,
+                    retry_after=retry_after,
+                ) from error
+
+            raise PermanentError(
+                str(error),
+                url=url,
+                status=error.status,
+            ) from error
+
+        except (
+                aiohttp.ClientSSLError,
+                aiohttp.ServerFingerprintMismatch,
+        ) as error:
+            raise PermanentError(
+                str(error),
+                url=url,
+            ) from error
+
+        except asyncio.TimeoutError as error:
+            raise TransientError(
+                "Request timed out",
+                url=url,
+            ) from error
+
+        except (
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientPayloadError,
+        ) as error:
+            raise NetworkError(
+                str(error),
+                url=url,
+            ) from error
 
     def get_request_stats(self) -> dict[str, int | float]:
         now = perf_counter()
@@ -170,50 +274,25 @@ class AsyncCrawler:
             "blocked_urls": len(self.blocked_urls),
         }
 
-    async def _fetch_with_retry(self, url: str) -> tuple[bool, str]:
-        """Вернуть (перенаправление, адрес или HTML), повторяя временные ошибки."""
-        delay = min(self.base_backoff, self.max_backoff)
-        for attempt in range(self.max_retries + 1):
-            wait = delay
+    async def _fetch_with_retry(
+            self,
+            url: str,
+    ) -> tuple[bool, str]:
+        attempt = 0
+
+        async def fetch() -> tuple[bool, str]:
+            nonlocal attempt
+            token = _retry_attempt.set(attempt)
+            attempt += 1
             try:
-                async with self._request(url) as response:
-                    if 300 <= response.status < 400:
-                        return True, redirect_target(response, url)
-                    response.raise_for_status()
-                    return False, await response.text()
-            except aiohttp.ClientResponseError as error:
-                if (
-                        error.status not in RETRYABLE_STATUSES
-                        or attempt == self.max_retries
-                ):
-                    raise
+                return await self._fetch_once(url)
+            finally:
+                _retry_attempt.reset(token)
 
-                if error.headers:
-                    wait = max(
-                        delay,
-                        retry_after_seconds(
-                            error.headers.get("Retry-After")
-                        ),
-                    )
-            except (aiohttp.ClientSSLError, aiohttp.ServerFingerprintMismatch):
-                raise
-            except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError):
-                if attempt == self.max_retries:
-                    raise
+        return await self.retry_strategy.execute_with_retry(fetch)
 
-            logger.warning(
-                "Повторный запрос %s через %.2f с (%d/%d)",
-                url,
-                wait,
-                attempt + 1,
-                self.max_retries,
-            )
-
-            await asyncio.sleep(wait)
-
-            delay = min(self.max_backoff, delay * 2)
-
-        raise AssertionError("unreachable")
+    def get_error_stats(self) -> dict:
+        return {**self.retry_strategy.get_stats(), "permanent_error_urls": sorted(self.permanent_error_urls)}
 
     async def crawl(
             self,
@@ -250,6 +329,8 @@ class AsyncCrawler:
         self.failed_urls.clear()
         self.processed_urls.clear()
         self.blocked_urls.clear()
+        self.permanent_error_urls.clear()
+        self.retry_strategy.reset_stats()
         self._reset_request_stats()
 
         def enqueue(url: str, depth: int) -> None:
@@ -350,6 +431,7 @@ class AsyncCrawler:
         """Загрузить HTML с проверкой robots.txt на каждом перенаправлении."""
         current, _ = urldefrag(url)
         seen = set()
+        recorded_error = False
         logger.info("Начало загрузки %s", url)
         try:
             for _ in range(MAX_REDIRECTS + 1):
@@ -369,7 +451,11 @@ class AsyncCrawler:
                         logger.info("URL запрещён robots.txt: %s", current)
                         raise RobotsDisallowedError(f"URL disallowed by robots.txt: {current}")
 
-                redirected, result = await self._fetch_with_retry(current)
+                try:
+                    redirected, result = await self._fetch_with_retry(current)
+                except Exception:
+                    recorded_error = True
+                    raise
                 if redirected:
                     current = result
                     continue
@@ -377,11 +463,12 @@ class AsyncCrawler:
                 logger.info("Загрузка %s успешно завершена", url)
                 return result
             raise RuntimeError(f"Too many redirects for {url}")
-        except asyncio.TimeoutError:
-            logger.error("Таймаут при загрузке %s", url)
-            raise
-        except aiohttp.ClientError as e:
-            logger.error("Ошибка при загрузке %s: %s", url, e)
+        except Exception as error:
+            if not recorded_error:
+                self.retry_strategy.record_error(error)
+            if isinstance(error, (PermanentError, RobotsDisallowedError)):
+                self.permanent_error_urls.add(url)
+            logger.error("%s при загрузке %s: %s", type(error).__name__, url, error)
             raise
 
     async def fetch_urls(self, urls: list[str]) -> dict[str, str]:
@@ -402,7 +489,14 @@ class AsyncCrawler:
         token = _final_url.set(None)
         try:
             html = await self.fetch_url(url)
-            return await self.html_parser.parse_html(html, _final_url.get() or url)
+            try:
+                return await self.html_parser.parse_html(html, _final_url.get() or url)
+            except Exception as error:
+                parsed_error = ParseError(str(error), url=url)
+                self.retry_strategy.record_error(parsed_error)
+                self.permanent_error_urls.add(url)
+                logger.error("ParseError: URL=%s, попытка=1, итог=ошибка: %s", url, error)
+                raise parsed_error from error
         finally:
             _final_url.reset(token)
 

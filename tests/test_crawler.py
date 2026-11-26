@@ -7,6 +7,7 @@ import pytest
 from aiohttp import web
 from aiointercept import aiointercept
 from async_crawler.crawler import AsyncCrawler
+from async_crawler.exceptions import PermanentError, TransientError
 from async_crawler.queue import CrawlerQueue
 
 
@@ -56,16 +57,19 @@ async def test_fetch_url_success():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [404, 500])
-async def test_fetch_url_http_error(status: int) -> None:
+@pytest.mark.parametrize(("status", "error_type"), [(404, PermanentError), (500, TransientError)])
+async def test_fetch_url_http_error(status: int, error_type: type[Exception]) -> None:
     crawler = AsyncCrawler(respect_robots=False, requests_per_second=1000, max_retries=0)
     async with aiointercept() as mocked:
         url = f"{mocked.server_url}/error"
         mocked.get(url, status=status)
         try:
-            with pytest.raises(aiohttp.ClientResponseError) as error:
+            with pytest.raises(error_type) as error:
                 await crawler.fetch_url(url)
             assert error.value.status == status
+            assert error.value.url == url
+            assert isinstance(error.value.__cause__, aiohttp.ClientResponseError)
+            assert error.value.__cause__.status == status
         finally:
             await crawler.close()
 
@@ -75,8 +79,10 @@ async def test_fetch_url_timeout() -> None:
     crawler = AsyncCrawler(respect_robots=False, requests_per_second=1000, max_retries=0)
     try:
         with patch.object(aiohttp.ClientSession, "get", side_effect=asyncio.TimeoutError):
-            with pytest.raises(asyncio.TimeoutError):
+            with pytest.raises(TransientError) as error:
                 await crawler.fetch_url("https://example.com/timeout")
+            assert error.value.url == "https://example.com/timeout"
+            assert isinstance(error.value.__cause__, asyncio.TimeoutError)
     finally:
         await crawler.close()
 

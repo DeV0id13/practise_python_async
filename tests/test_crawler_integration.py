@@ -8,6 +8,7 @@ import pytest
 from aiohttp import web
 
 from async_crawler.crawler import AsyncCrawler, RobotsDisallowedError
+from async_crawler.exceptions import PermanentError
 from async_crawler.robots import RobotsParser, RobotsUnavailableError
 
 
@@ -196,8 +197,11 @@ async def test_missing_robots_allows_page(serve):
         await crawler.close()
 
 
-@pytest.mark.parametrize("kind", ["loop", "missing", "unhandled"])
-async def test_invalid_page_redirects_are_rejected(serve, kind):
+@pytest.mark.parametrize(
+    ("kind", "error_type", "status"),
+    [("loop", RuntimeError, None), ("missing", PermanentError, 302), ("unhandled", PermanentError, 304)],
+)
+async def test_invalid_page_redirects_are_rejected(serve, kind, error_type, status):
     async def handler(request):
         if kind == "loop":
             return web.Response(status=302, headers={"Location": "/page"})
@@ -208,8 +212,12 @@ async def test_invalid_page_redirects_are_rejected(serve, kind):
     root = await serve(handler)
     crawler = AsyncCrawler(respect_robots=False, requests_per_second=1000)
     try:
-        with pytest.raises((RuntimeError, aiohttp.ClientResponseError)):
+        with pytest.raises(error_type) as error:
             await crawler.fetch_url(f"{root}/page")
+        if status is not None:
+            assert error.value.status == status
+            assert error.value.url == f"{root}/page"
+            assert isinstance(error.value.__cause__, aiohttp.ClientResponseError)
     finally:
         await crawler.close()
 

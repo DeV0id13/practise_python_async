@@ -6,6 +6,7 @@ import aiohttp
 import pytest
 
 from async_crawler.crawler import AsyncCrawler
+from async_crawler.exceptions import NetworkError, PermanentError, TransientError
 
 
 def response(status, text="ok"):
@@ -57,9 +58,11 @@ async def test_non_retryable_http_error_is_raised_immediately(monkeypatch, statu
         yield response(status)
 
     monkeypatch.setattr(crawler, "_request", request)
-    with pytest.raises(aiohttp.ClientResponseError) as error:
+    with pytest.raises(PermanentError) as error:
         await crawler._fetch_with_retry("https://example.com/")
     assert error.value.status == status
+    assert error.value.url == "https://example.com/"
+    assert isinstance(error.value.__cause__, aiohttp.ClientResponseError)
     assert len(calls) == 1
 
 
@@ -74,14 +77,20 @@ async def test_retryable_http_error_stops_after_max_retries(monkeypatch, status)
         yield response(status)
 
     monkeypatch.setattr(crawler, "_request", request)
-    with pytest.raises(aiohttp.ClientResponseError) as error:
+    with pytest.raises(TransientError) as error:
         await crawler._fetch_with_retry("https://example.com/")
     assert error.value.status == status
+    assert error.value.url == "https://example.com/"
+    assert isinstance(error.value.__cause__, aiohttp.ClientResponseError)
     assert len(attempts) == 3
 
 
-@pytest.mark.parametrize("failure", [asyncio.TimeoutError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError])
-async def test_transient_exceptions_retry_until_limit(monkeypatch, failure):
+@pytest.mark.parametrize(
+    ("failure", "error_type"),
+    [(asyncio.TimeoutError, TransientError), (aiohttp.ClientConnectionError, NetworkError),
+     (aiohttp.ClientPayloadError, NetworkError)],
+)
+async def test_transient_exceptions_retry_until_limit(monkeypatch, failure, error_type):
     crawler = AsyncCrawler(max_retries=2, base_backoff=0)
     attempts = []
 
@@ -92,8 +101,10 @@ async def test_transient_exceptions_retry_until_limit(monkeypatch, failure):
         yield
 
     monkeypatch.setattr(crawler, "_request", request)
-    with pytest.raises(failure):
+    with pytest.raises(error_type) as error:
         await crawler._fetch_with_retry("https://example.com/")
+    assert error.value.url == "https://example.com/"
+    assert isinstance(error.value.__cause__, failure)
     assert len(attempts) == 3
 
 
